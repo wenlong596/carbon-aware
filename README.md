@@ -52,9 +52,30 @@ The script performs the following steps:
 ### 6. Economic & emission analysis
 
 * Compute:
-
   * electricity costs (Flat / TOU / RTP)
   * emissions (tCO₂)
   * carbon value under different carbon prices
 * Generate daily summary statistics
+
+### 7. Dispatch rule design
+
+* Define three dispatch rules:
+  * Rule A: carbon-first rule
+  * Rule B: price-first rule
+  * Rule C: hybrid rule combining normalized carbon intensity and price
+* Support multiple hybrid weights (alpha values)
+
+### 8. Source and target hour identification
+
+* Identify complete 24-hour days
+* Rank hours according to the selected dispatch rule
+* Mark:
+  * avoid / source hours (highest-score hours)
+  *  target hours (lowest-score hours)
+* Repeat the identification under different tariff scenarios (Flat / TOU / RTP)
+
+### 9. Additional visualization
+* Plot source and target hour identification for different dispatch rules
+* Compare daily carbon and price signals used for dispatch
+
 
