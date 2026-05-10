@@ -36,41 +36,105 @@ df[CI_KG_COL] = pd.to_numeric(df[CI_KG_COL], errors="coerce")
 
 
 # =========================
-# Step 1A - TOU (Portugal 3-period) ERES
+# Step 1A - TOU (Portugal Continental 3-period, ERSE weekly cycle)
 # =========================
+# Based on ERSE Continental / Weekly / 24-hour timetable.
+#
+# ERSE original periods:
+#   Super off-peak, Off-peak, Mid-peak, Peak
+#
+# Three-period mapping in this study:
+#   offpeak  = Super off-peak + Off-peak
+#   shoulder = Mid-peak
+#   peak     = Peak
+#
+# Timetable:
+#   Summer = June to October
+#   Winter = November to May
 
-# Periods: offpeak / shoulder / peak
-def tou_portugal_3period(dow: int, minute_of_day: int) -> str:
-    # Sunday: offpeak all day
+
+def is_erse_summer(month: int) -> bool:
+    """
+    ERSE timetable:
+    Summer: June to October
+    Winter: November to May
+    """
+    return month in [6, 7, 8, 9, 10]
+
+
+def tou_portugal_3period_erse(ts) -> str:
+    """
+    ERSE-based 3-period TOU mapping for Portugal Continental,
+    weekly cycle, 24-hour format.
+
+    Returns:
+        "offpeak", "shoulder", or "peak"
+    """
+    ts = pd.Timestamp(ts)
+
+    dow = ts.dayofweek  # Monday=0, ..., Sunday=6
+    m = ts.hour * 60 + ts.minute
+    summer = is_erse_summer(ts.month)
+
+    # Sunday:
+    # ERSE shows only super off-peak/off-peak.
+    # Since both are merged in this study, Sunday is fully offpeak.
     if dow == 6:
         return "offpeak"
 
-    # Saturday: peak 09:30-13:00, otherwise offpeak 
+    # Saturday
     if dow == 5:
-        peak_start = 9 * 60 + 30
-        peak_end   = 13 * 60
-        if peak_start <= minute_of_day < peak_end:
+        if summer:
+            # Summer Saturday:
+            # 00:00-09:00 offpeak
+            # 09:00-14:00 shoulder
+            # 14:00-20:00 offpeak
+            # 20:00-22:00 shoulder
+            # 22:00-24:00 offpeak
+            if (9 * 60 <= m < 14 * 60) or (20 * 60 <= m < 22 * 60):
+                return "shoulder"
+            return "offpeak"
+
+        else:
+            # Winter Saturday:
+            # 00:00-09:30 offpeak
+            # 09:30-13:00 shoulder
+            # 13:00-18:30 offpeak
+            # 18:30-22:00 shoulder
+            # 22:00-24:00 offpeak
+            if (9 * 60 + 30 <= m < 13 * 60) or (18 * 60 + 30 <= m < 22 * 60):
+                return "shoulder"
+            return "offpeak"
+
+    # Monday to Friday
+    if summer:
+        # Summer weekdays:
+        # 00:00-07:00 offpeak
+        # 07:00-09:15 shoulder
+        # 09:15-12:15 peak
+        # 12:15-24:00 shoulder
+        if m < 7 * 60:
+            return "offpeak"
+        if 9 * 60 + 15 <= m < 12 * 60 + 15:
             return "peak"
-        return "offpeak"
+        return "shoulder"
 
-    # Weekdays (Mon-Fri)
-    # offpeak: 22:00-24:00 and 00:00-08:00
-    if minute_of_day < 8 * 60 or minute_of_day >= 22 * 60:
-        return "offpeak"
+    else:
+        # Winter weekdays:
+        # 00:00-07:00 offpeak
+        # 07:00-09:30 shoulder
+        # 09:30-12:00 peak
+        # 12:00-18:30 shoulder
+        # 18:30-21:00 peak
+        # 21:00-24:00 shoulder
+        if m < 7 * 60:
+            return "offpeak"
+        if (9 * 60 + 30 <= m < 12 * 60) or (18 * 60 + 30 <= m < 21 * 60):
+            return "peak"
+        return "shoulder"
 
-    # peak: 09:30-12:30
-    peak_start = 9 * 60 + 30
-    peak_end   = 12 * 60 + 30
-    if peak_start <= minute_of_day < peak_end:
-        return "peak"
 
-    # shoulder: rest of 08:00-22:00 excluding peak
-    return "shoulder"
-
-df["tou_period"] = [
-    tou_portugal_3period(d, m)
-    for d, m in zip(df["dow"].to_numpy(), df["minute_of_day"].to_numpy())
-]
+df["tou_period"] = df[TIME_COL].apply(tou_portugal_3period_erse)
 
 
 # =========================
@@ -367,17 +431,22 @@ def _minmax(s: pd.Series) -> pd.Series:
 def compute_score(day_df: pd.DataFrame, rule: str, price_col: str = None, alpha: float = 0.5) -> pd.Series:
     """
     Higher score = worse = avoid/source priority
-    Rule A: carbon-first rule
-    Rule B: Price-first rule (tariff-specific)
+
+    Rule A: price-first rule
+    Rule B: carbon-first rule
     Rule C: hybrid of normalized carbon + normalized tariff-specific price
+
+    For Rule C:
+    alpha = 0   -> price-only
+    alpha = 1   -> carbon-only
     """
     if rule == "A":
-        return day_df[CI_COL].astype(float)
+        if price_col is None:
+            raise ValueError("price_col must be provided for Rule A.")
+        return day_df[price_col].astype(float)
 
     elif rule == "B":
-        if price_col is None:
-            raise ValueError("price_col must be provided for Rule B.")
-        return day_df[price_col].astype(float)
+        return day_df[CI_COL].astype(float)
 
     elif rule == "C":
         if price_col is None:
@@ -423,9 +492,9 @@ def run_step3_rules(df: pd.DataFrame,
       timestamp, date, hour, tariff, rule, alpha, score, avoid, target
 
     Notes:
-    - Rule A is carbon-first rule, so score itself does not depend on tariff.
-      But we still repeat it under each tariff for easier downstream merging/comparison.
-    - Rule B and Rule C use tariff-specific price columns.
+    - Rule A is price-first rule, so it uses tariff-specific price columns.
+    - Rule B is carbon-first rule, so its score does not depend on tariff.
+    - Rule C uses both tariff-specific price columns and carbon intensity.
     """
 
     required_cols = [time_col, ci_col] + list(price_cols.values())
@@ -462,13 +531,13 @@ def run_step3_rules(df: pd.DataFrame,
 
         for tariff_name, price_col in price_cols.items():
 
-            # Rule A: carbon-first rule 
-            sA = compute_score(day_df, rule="A")
+            # Rule A: price-first rule 
+            sA = compute_score(day_df, rule="A", price_col=price_col)
             avoidA = label_top_hours(day_df, sA, top_pct=top_pct)
             targetA = label_bottom_hours(day_df, sA, top_pct=top_pct)
 
             out.append(pd.DataFrame({
-                time_col: day_df[time_col].values,
+                time_col: day_df[time_col].tolist(),
                 "date": day_df["date"].values,
                 "hour": day_df["hour"].values,
                 "tariff": tariff_name,
@@ -479,13 +548,13 @@ def run_step3_rules(df: pd.DataFrame,
                 "target": targetA.values
             }))
 
-            # Rule B: Price-first rule 
-            sB = compute_score(day_df, rule="B", price_col=price_col)
+            # Rule B: carbon-first rule 
+            sB = compute_score(day_df, rule="B")
             avoidB = label_top_hours(day_df, sB, top_pct=top_pct)
             targetB = label_bottom_hours(day_df, sB, top_pct=top_pct)
 
             out.append(pd.DataFrame({
-                time_col: day_df[time_col].values,
+                time_col: day_df[time_col].tolist(),
                 "date": day_df["date"].values,
                 "hour": day_df["hour"].values,
                 "tariff": tariff_name,
@@ -503,7 +572,7 @@ def run_step3_rules(df: pd.DataFrame,
                 targetC = label_bottom_hours(day_df, sC, top_pct=top_pct)
 
                 out.append(pd.DataFrame({
-                    time_col: day_df[time_col].values,
+                    time_col: day_df[time_col].tolist(),
                     "date": day_df["date"].values,
                     "hour": day_df["hour"].values,
                     "tariff": tariff_name,
@@ -558,9 +627,14 @@ def plot_step3_day_0_24h(step3_res,
         y_ext = list(y) + [y.iloc[-1]]
         return x_ext, y_ext
 
+    #r = step3_res.copy()
+    #r[time_col] = pd.to_datetime(r[time_col], errors="coerce")
+    #r["date"] = pd.to_datetime(r[time_col]).dt.date
+
     r = step3_res.copy()
-    r[time_col] = pd.to_datetime(r[time_col], errors="coerce")
-    r["date"] = pd.to_datetime(r[time_col]).dt.date
+    r["date"] = pd.to_datetime(r["date"]).dt.date
+
+    
 
     subA = r[
         (r["date"] == plot_day) &
@@ -582,20 +656,11 @@ def plot_step3_day_0_24h(step3_res,
     ].sort_values("hour")
 
     fig, axes = plt.subplots(
-        5, 1, figsize=(12, 12), sharex=True,
-        gridspec_kw={"height_ratios": [1.2, 1.2, 1, 1, 1]}
+        3, 1, figsize=(12, 8), sharex=True,
+        gridspec_kw={"height_ratios": [1, 1, 1]}
     )
 
-    x_ci, y_ci = extend_to_24(day_df["hour"], day_df[ci_col])
-    axes[0].plot(x_ci, y_ci, drawstyle="steps-post")
-    axes[0].set_ylabel("CI")
-    axes[0].set_title(f"Source and target hour identification under {tariff.upper()} tariff ({plot_day})")
-
-    x_p, y_p = extend_to_24(day_df["hour"], day_df[price_col])
-    axes[1].plot(x_p, y_p, drawstyle="steps-post")
-    axes[1].set_ylabel("Price")
-
-    def draw_rule(ax, sub, label):
+    def draw_rule(ax, sub, label, ylabel):
         x_s, y_s = extend_to_24(sub["hour"], sub["score"])
         ax.plot(x_s, y_s, drawstyle="steps-post")
 
@@ -607,15 +672,22 @@ def plot_step3_day_0_24h(step3_res,
 
         for h in avoid["hour"]:
             ax.axvspan(h, h + 1, alpha=0.15)
+
         for h in target["hour"]:
             ax.axvspan(h, h + 1, alpha=0.10)
 
-        ax.set_ylabel(label)
+        ax.set_ylabel(ylabel)
         ax.legend(fontsize=8)
 
-    draw_rule(axes[2], subA, "Rule A")
-    draw_rule(axes[3], subB, "Rule B")
-    draw_rule(axes[4], subC, "Rule C")
+
+    draw_rule(axes[0], subA, "Rule A", "Rule A Price\n(EUR/kWh)")
+    draw_rule(axes[1], subB, "Rule B", "Rule B CI\n(kgCO₂/kWh)")
+    draw_rule(axes[2], subC, "Rule C", "Rule C Hybrid\n(normalized)")
+    
+
+    axes[0].set_title(
+        f"Source and target hour identification under {tariff.upper()} tariff ({plot_day})"
+    )
 
     axes[-1].set_xlim(0, 24)
     axes[-1].set_xticks(range(25))
@@ -630,7 +702,6 @@ def plot_step3_day_0_24h(step3_res,
 # =========================
 def plot_step3_for_selected_day(df, step3_res, plot_day):
 
-    #print("\n--- TOU ---")
     plot_step3_day_0_24h(
         step3_res=step3_res,
         original_df=df,
@@ -639,7 +710,6 @@ def plot_step3_for_selected_day(df, step3_res, plot_day):
         alpha=0.5
     )
 
-    #print("\n--- RTP ---")
     plot_step3_day_0_24h(
         step3_res=step3_res,
         original_df=df,
@@ -648,11 +718,15 @@ def plot_step3_for_selected_day(df, step3_res, plot_day):
         alpha=0.5
     )
 
+
 # =========================
 # Run Step 3 + Plot
 # =========================
 step3_res = run_step3_rules(df)
 plot_step3_for_selected_day(df, step3_res, plot_day)
+
+
+
 
 
 
