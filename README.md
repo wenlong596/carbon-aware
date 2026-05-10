@@ -60,8 +60,8 @@ The script performs the following steps:
 ### 7. Dispatch rule design
 
 * Define three dispatch rules:
-  * Rule A: carbon-first rule
-  * Rule B: price-first rule
+  * Rule A: price-first rule
+  * Rule B: carbon-first rule
   * Rule C: hybrid rule combining normalized carbon intensity and price
 * Support multiple hybrid weights (alpha values)
 
