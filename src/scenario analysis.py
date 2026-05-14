@@ -394,7 +394,7 @@ daily = df2.groupby("date", as_index=False).agg(
 
 print("Number of daily records:", len(daily))
 print("Date range:", daily["date"].min(), "to", daily["date"].max())
-print(daily.head())
+#print(daily.head())
 
 
 # =========================
@@ -727,6 +727,655 @@ plot_step3_for_selected_day(df, step3_res, plot_day)
 
 
 
+# =========================
+# Step 4 - Constrained Load-Shifting Simulation
+# =========================
+
+FLEX_SHARES = [0.10, 0.15, 0.20]
+
+# Shifted load cannot exceed 110% of the original daily peak
+PEAK_CAP_FACTOR = 1.10
+
+# Ramp constraint:
+# shifted ramp cannot exceed RAMP_LIMIT_FACTOR times the maximum baseline daily ramp
+RAMP_LIMIT_FACTOR = 1.50
+
+# Maximum consecutive controlled hours
+MAX_CONSECUTIVE_CONTROL_HOURS = 3
 
 
+def limit_consecutive_hours(mask, scores, max_hours, mode="source"):
+    """
+    Limit consecutive True values in a boolean mask.
 
+    mode="source": keep highest-score hours within a consecutive block.
+    mode="target": keep lowest-score hours within a consecutive block.
+    """
+    mask = np.asarray(mask, dtype=bool).copy()
+    scores = np.asarray(scores, dtype=float)
+
+    if max_hours is None:
+        return mask
+
+    n = len(mask)
+    new_mask = mask.copy()
+    i = 0
+
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+
+        start = i
+        while i < n and mask[i]:
+            i += 1
+        end = i
+
+        block_indices = np.arange(start, end)
+
+        if len(block_indices) > max_hours:
+            if mode == "source":
+                keep = block_indices[np.argsort(scores[block_indices])[-max_hours:]]
+            elif mode == "target":
+                keep = block_indices[np.argsort(scores[block_indices])[:max_hours]]
+            else:
+                raise ValueError("mode must be 'source' or 'target'")
+
+            remove = np.setdiff1d(block_indices, keep)
+            new_mask[remove] = False
+
+    return new_mask
+
+
+def check_ramp_constraint(load, ramp_limit_kWh):
+    """
+    Check whether shifted load satisfies the ramping constraint.
+    """
+    if ramp_limit_kWh is None:
+        return True
+
+    ramps = np.abs(np.diff(load))
+    return np.all(ramps <= ramp_limit_kWh + 1e-9)
+
+
+def max_feasible_pair_shift(
+    L0,
+    x,
+    y,
+    src_idx,
+    tgt_idx,
+    requested_delta,
+    daily_peak_cap,
+    ramp_limit_kWh,
+    inflexible
+):
+    """
+    Find the maximum feasible amount that can be shifted from one source hour
+    to one target hour while satisfying:
+    - non-negative flexible reduction
+    - target peak cap
+    - ramp constraint
+    - inflexible-load lower bound
+    """
+
+    if requested_delta <= 0:
+        return 0.0
+
+    # Upper bound due to target peak cap
+    target_capacity = daily_peak_cap - (L0[tgt_idx] + y[tgt_idx])
+    target_capacity = max(0.0, target_capacity)
+
+    hi = min(requested_delta, target_capacity)
+
+    if hi <= 0:
+        return 0.0
+
+    def feasible(delta):
+        x_try = x.copy()
+        y_try = y.copy()
+
+        x_try[src_idx] += delta
+        y_try[tgt_idx] += delta
+
+        L_try = L0 - x_try + y_try
+
+        if np.any(L_try < inflexible - 1e-9):
+            return False
+
+        if np.any(L_try > daily_peak_cap + 1e-9):
+            return False
+
+        if not check_ramp_constraint(L_try, ramp_limit_kWh):
+            return False
+
+        return True
+
+    # If full amount is feasible, use it
+    if feasible(hi):
+        return hi
+
+    # Otherwise use binary search
+    lo = 0.0
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if feasible(mid):
+            lo = mid
+        else:
+            hi = mid
+
+    return lo
+
+
+def run_step4_load_shifting(
+    df: pd.DataFrame,
+    step3_res: pd.DataFrame,
+    flex_shares: list = FLEX_SHARES,
+    peak_cap_factor: float = PEAK_CAP_FACTOR,
+    ramp_limit_factor: float = RAMP_LIMIT_FACTOR,
+    max_consecutive_control_hours: int = MAX_CONSECUTIVE_CONTROL_HOURS,
+    time_col: str = TIME_COL,
+    load_col: str = E_COL,
+    ci_col: str = CI_COL,
+    price_cols: dict = PRICE_COLS
+) -> pd.DataFrame:
+
+    base = df.copy()
+    base[time_col] = pd.to_datetime(base[time_col], errors="coerce")
+    base["date"] = base[time_col].dt.date
+    base["hour"] = base[time_col].dt.hour
+
+    base[load_col] = pd.to_numeric(base[load_col], errors="coerce")
+    base[ci_col] = pd.to_numeric(base[ci_col], errors="coerce")
+
+    required_base_cols = [time_col, "date", "hour", load_col, ci_col] + list(price_cols.values())
+    base = base.dropna(subset=required_base_cols).copy()
+
+    r = step3_res.copy()
+    r["date"] = pd.to_datetime(r["date"]).dt.date
+
+    out = []
+    group_cols = ["date", "tariff", "rule", "alpha"]
+
+    for (date, tariff, rule, alpha), rule_df in r.groupby(group_cols, dropna=False):
+
+        day_base = base[base["date"] == date].sort_values("hour").copy()
+        rule_day = rule_df.sort_values("hour").copy()
+
+        if len(day_base) != 24 or day_base["hour"].nunique() != 24:
+            continue
+
+        if len(rule_day) != 24 or rule_day["hour"].nunique() != 24:
+            continue
+
+        price_col = price_cols[tariff]
+
+        day = day_base.merge(
+            rule_day[[time_col, "tariff", "rule", "alpha", "score", "avoid", "target"]],
+            on=time_col,
+            how="inner"
+        )
+
+        if len(day) != 24:
+            continue
+
+        day = day.sort_values("hour").reset_index(drop=True)
+
+        L0 = day[load_col].astype(float).to_numpy()
+        score = day["score"].astype(float).to_numpy()
+
+        avoid_mask_raw = day["avoid"].astype(bool).to_numpy()
+        target_mask_raw = day["target"].astype(bool).to_numpy()
+
+        # Apply maximum consecutive control duration
+        avoid_mask = limit_consecutive_hours(
+            avoid_mask_raw,
+            score,
+            max_consecutive_control_hours,
+            mode="source"
+        )
+
+        target_mask = limit_consecutive_hours(
+            target_mask_raw,
+            score,
+            max_consecutive_control_hours,
+            mode="target"
+        )
+
+        daily_peak_cap = peak_cap_factor * np.nanmax(L0)
+
+        baseline_ramps = np.abs(np.diff(L0))
+        max_baseline_ramp = np.nanmax(baseline_ramps)
+
+        if np.isclose(max_baseline_ramp, 0.0):
+            ramp_limit_kWh = None
+        else:
+            ramp_limit_kWh = ramp_limit_factor * max_baseline_ramp
+
+        for lam in flex_shares:
+
+            flexible = lam * L0
+            inflexible = (1 - lam) * L0
+
+            x = np.zeros(len(day))
+            y = np.zeros(len(day))
+
+            # Source hours: highest score first
+            source_order = (
+                day.loc[avoid_mask]
+                   .sort_values("score", ascending=False)
+                   .index
+                   .to_list()
+            )
+
+            # Target hours: lowest score first
+            target_order = (
+                day.loc[target_mask]
+                   .sort_values("score", ascending=True)
+                   .index
+                   .to_list()
+            )
+
+            if len(source_order) == 0 or len(target_order) == 0:
+                continue
+
+            total_shift_potential = flexible[avoid_mask].sum()
+
+            for src_idx in source_order:
+
+                source_remaining = flexible[src_idx] - x[src_idx]
+
+                if source_remaining <= 1e-9:
+                    continue
+
+                for tgt_idx in target_order:
+
+                    if source_remaining <= 1e-9:
+                        break
+
+                    delta = max_feasible_pair_shift(
+                        L0=L0,
+                        x=x,
+                        y=y,
+                        src_idx=src_idx,
+                        tgt_idx=tgt_idx,
+                        requested_delta=source_remaining,
+                        daily_peak_cap=daily_peak_cap,
+                        ramp_limit_kWh=ramp_limit_kWh,
+                        inflexible=inflexible
+                    )
+
+                    if delta <= 1e-9:
+                        continue
+
+                    x[src_idx] += delta
+                    y[tgt_idx] += delta
+                    source_remaining -= delta
+
+            L_shift = L0 - x + y
+
+            energy_diff = L_shift.sum() - L0.sum()
+
+            result = day.copy()
+
+            result["flex_share"] = lam
+            result["L0_kWh"] = L0
+            result["flexible_kWh"] = flexible
+            result["inflexible_kWh"] = inflexible
+
+            result["avoid_raw"] = avoid_mask_raw
+            result["target_raw"] = target_mask_raw
+            result["avoid_limited"] = avoid_mask
+            result["target_limited"] = target_mask
+
+            result["x_reduced_kWh"] = x
+            result["y_added_kWh"] = y
+            result["L_shifted_kWh"] = L_shift
+
+            result["daily_peak_cap_kWh"] = daily_peak_cap
+            result["ramp_limit_kWh"] = ramp_limit_kWh
+            result["max_consecutive_control_hours"] = max_consecutive_control_hours
+
+            result["shift_potential_kWh"] = total_shift_potential
+            result["shift_out_kWh"] = x.sum()
+            result["shift_in_kWh"] = y.sum()
+            result["unallocated_shift_kWh"] = total_shift_potential - x.sum()
+            result["energy_difference_kWh"] = energy_diff
+
+            result["ramp_violation"] = not check_ramp_constraint(L_shift, ramp_limit_kWh)
+            result["peak_violation"] = np.any(L_shift > daily_peak_cap + 1e-9)
+
+            result["emission_base_kgCO2"] = result["L0_kWh"] * result[ci_col]
+            result["emission_shifted_kgCO2"] = result["L_shifted_kWh"] * result[ci_col]
+
+            result["price_used_EUR_per_kWh"] = result[price_col]
+            result["cost_base_EUR"] = result["L0_kWh"] * result["price_used_EUR_per_kWh"]
+            result["cost_shifted_EUR"] = result["L_shifted_kWh"] * result["price_used_EUR_per_kWh"]
+
+            out.append(result)
+
+    if len(out) == 0:
+        raise ValueError("No shifted load results were generated. Check Step 3 output and complete days.")
+
+    return pd.concat(out, ignore_index=True)
+
+
+# =========================
+# Run Step 4
+# =========================
+
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.expand_frame_repr", False)
+pd.set_option("display.width", 200)
+
+shifted_res = run_step4_load_shifting(df, step3_res)
+
+#print("Step 4 shifted results:")
+#print(shifted_res.head())
+
+print("\nNumber of rows:", len(shifted_res))
+print("Tariffs:", shifted_res["tariff"].unique())
+print("Rules:", shifted_res["rule"].unique())
+print("Flex shares:", shifted_res["flex_share"].unique())
+
+print("\nRows by tariff:")
+print(shifted_res["tariff"].value_counts())
+
+#print("\nRows by tariff and rule:")
+#print(shifted_res.groupby(["tariff", "rule"]).size())
+
+
+# =========================
+# Step 4A - Daily Summary
+# =========================
+
+daily_shift_summary = shifted_res.groupby(
+    ["date", "tariff", "rule", "alpha", "flex_share"],
+    dropna=False,
+    as_index=False
+).agg(
+    L0_kWh=("L0_kWh", "sum"),
+    L_shifted_kWh=("L_shifted_kWh", "sum"),
+    shift_potential_kWh=("shift_potential_kWh", "max"),
+    shift_out_kWh=("x_reduced_kWh", "sum"),
+    shift_in_kWh=("y_added_kWh", "sum"),
+    unallocated_shift_kWh=("unallocated_shift_kWh", "max"),
+    emission_base_kgCO2=("emission_base_kgCO2", "sum"),
+    emission_shifted_kgCO2=("emission_shifted_kgCO2", "sum"),
+    cost_base_EUR=("cost_base_EUR", "sum"),
+    cost_shifted_EUR=("cost_shifted_EUR", "sum"),
+    max_L0_kWh=("L0_kWh", "max"),
+    max_L_shifted_kWh=("L_shifted_kWh", "max"),
+    daily_peak_cap_kWh=("daily_peak_cap_kWh", "max"),
+    ramp_limit_kWh=("ramp_limit_kWh", "max"),
+    ramp_violation=("ramp_violation", "max"),
+    peak_violation=("peak_violation", "max"),
+    max_energy_difference_kWh=("energy_difference_kWh", "max")
+)
+
+daily_shift_summary["emission_reduction_kgCO2"] = (
+    daily_shift_summary["emission_base_kgCO2"]
+    - daily_shift_summary["emission_shifted_kgCO2"]
+)
+
+daily_shift_summary["cost_change_EUR"] = (
+    daily_shift_summary["cost_shifted_EUR"]
+    - daily_shift_summary["cost_base_EUR"]
+)
+
+daily_shift_summary["energy_conservation_error_kWh"] = (
+    daily_shift_summary["L_shifted_kWh"]
+    - daily_shift_summary["L0_kWh"]
+)
+
+#print("\nDaily shift summary:")
+#print(daily_shift_summary.head())
+
+print("\nMax absolute daily energy difference:")
+print(daily_shift_summary["energy_conservation_error_kWh"].abs().max())
+
+print("\nRamp violations:")
+print(daily_shift_summary["ramp_violation"].sum())
+
+print("\nPeak violations:")
+print(daily_shift_summary["peak_violation"].sum())
+
+
+# =========================
+# Step 4B - Summary by Case
+# =========================
+
+summary_by_case = daily_shift_summary.groupby(
+    ["tariff", "rule", "alpha", "flex_share"],
+    dropna=False,
+    as_index=False
+).agg(
+    mean_emission_reduction_kgCO2=("emission_reduction_kgCO2", "mean"),
+    total_emission_reduction_kgCO2=("emission_reduction_kgCO2", "sum"),
+    mean_cost_change_EUR=("cost_change_EUR", "mean"),
+    total_cost_change_EUR=("cost_change_EUR", "sum"),
+    mean_shift_potential_kWh=("shift_potential_kWh", "mean"),
+    mean_shift_out_kWh=("shift_out_kWh", "mean"),
+    mean_shift_in_kWh=("shift_in_kWh", "mean"),
+    mean_unallocated_shift_kWh=("unallocated_shift_kWh", "mean"),
+    mean_max_L0_kWh=("max_L0_kWh", "mean"),
+    mean_max_L_shifted_kWh=("max_L_shifted_kWh", "mean")
+)
+
+from pathlib import Path
+
+# =========================
+# Save summary tables
+# =========================
+
+RESULT_DIR = Path(r"C:\Users\LIUWENLONG\Desktop\carbon-aware-dr-wenlong\result")
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+summary_by_case.to_csv(
+    RESULT_DIR / "summary_by_case.csv",
+    index=False
+)
+
+daily_shift_summary.to_csv(
+    RESULT_DIR / "daily_shift_summary.csv",
+    index=False
+)
+
+print("\nSaved:")
+print(RESULT_DIR / "summary_by_case.csv")
+print(RESULT_DIR / "daily_shift_summary.csv")
+
+# =========================
+# Baseline vs shifted load
+# =========================
+
+def plot_baseline_vs_shifted(
+    shifted_res,
+    plot_day,
+    tariff="rtp",
+    rule="C",
+    alpha=0.5,
+    flex_share=0.15,
+    time_col="timestamp"
+):
+    d = shifted_res.copy()
+    d[time_col] = pd.to_datetime(d[time_col], errors="coerce")
+    d["date"] = pd.to_datetime(d["date"]).dt.date
+
+    plot_day = pd.to_datetime(plot_day).date()
+
+    if rule == "C":
+        sub = d[
+            (d["date"] == plot_day) &
+            (d["tariff"] == tariff) &
+            (d["rule"] == rule) &
+            (np.isclose(d["alpha"], alpha)) &
+            (np.isclose(d["flex_share"], flex_share))
+        ].sort_values("hour")
+    else:
+        sub = d[
+            (d["date"] == plot_day) &
+            (d["tariff"] == tariff) &
+            (d["rule"] == rule) &
+            (np.isclose(d["flex_share"], flex_share))
+        ].sort_values("hour")
+
+    if len(sub) != 24:
+        raise ValueError("No complete 24-hour result found for the selected case.")
+
+    x = sub["hour"].tolist() + [24]
+    y_base = sub["L0_kWh"].tolist() + [sub["L0_kWh"].iloc[-1]]
+    y_shift = sub["L_shifted_kWh"].tolist() + [sub["L_shifted_kWh"].iloc[-1]]
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(x, y_base, drawstyle="steps-post", label="Baseline load", linewidth=2)
+    plt.plot(x, y_shift, drawstyle="steps-post", label="Shifted load", linewidth=2)
+
+    for h in sub.loc[sub["avoid_limited"], "hour"]:
+        plt.axvspan(h, h + 1, alpha=0.12)
+
+    for h in sub.loc[sub["target_limited"], "hour"]:
+        plt.axvspan(h, h + 1, alpha=0.08)
+
+    title_alpha = f", alpha={alpha}" if rule == "C" else ""
+
+    plt.title(
+        f"Baseline vs shifted load under {tariff.upper()} tariff, "
+        f"Rule {rule}{title_alpha}, flex={flex_share} ({plot_day})"
+    )
+    plt.xlabel("Hour of day")
+    plt.ylabel("Electricity load (kWh)")
+    plt.xticks(range(25))
+    plt.xlim(0, 24)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+plot_baseline_vs_shifted(
+    shifted_res=shifted_res,
+    plot_day=plot_day,
+    tariff="rtp",
+    rule="C",
+    alpha=0.5,
+    flex_share=0.15
+)
+
+# =========================
+# Emission reduction vs alpha
+# =========================
+
+def plot_emission_reduction_vs_alpha(summary_by_case, tariff="rtp"):
+    d = summary_by_case.copy()
+
+    sub = d[
+        (d["tariff"] == tariff) &
+        (d["rule"] == "C")
+    ].sort_values(["flex_share", "alpha"])
+
+    plt.figure(figsize=(8, 5))
+
+    for flex in sorted(sub["flex_share"].unique()):
+        s = sub[sub["flex_share"] == flex]
+        plt.plot(
+            s["alpha"],
+            s["total_emission_reduction_kgCO2"],
+            marker="o",
+            label=f"flex={flex}"
+        )
+
+    plt.title(f"Emission reduction under {tariff.upper()} tariff")
+    plt.xlabel("Carbon weight alpha")
+    plt.ylabel("Total emission reduction (kgCO₂)")
+    plt.xticks([0, 0.25, 0.5, 0.75, 1.0])
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+plot_emission_reduction_vs_alpha(summary_by_case, tariff="tou")
+plot_emission_reduction_vs_alpha(summary_by_case, tariff="rtp")
+
+# =========================
+# Cost change vs alpha
+# =========================
+
+def plot_cost_change_vs_alpha(summary_by_case, tariff="rtp"):
+    d = summary_by_case.copy()
+
+    sub = d[
+        (d["tariff"] == tariff) &
+        (d["rule"] == "C")
+    ].sort_values(["flex_share", "alpha"])
+
+    plt.figure(figsize=(8, 5))
+
+    for flex in sorted(sub["flex_share"].unique()):
+        s = sub[sub["flex_share"] == flex]
+        plt.plot(
+            s["alpha"],
+            s["total_cost_change_EUR"],
+            marker="o",
+            label=f"flex={flex}"
+        )
+
+    plt.axhline(0, linewidth=1)
+    plt.title(f"Cost change under {tariff.upper()} tariff")
+    plt.xlabel("Carbon weight alpha")
+    plt.ylabel("Total cost change (EUR)")
+    plt.xticks([0, 0.25, 0.5, 0.75, 1.0])
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+plot_cost_change_vs_alpha(summary_by_case, tariff="tou")
+plot_cost_change_vs_alpha(summary_by_case, tariff="rtp")
+
+# =========================
+# Cost–emission trade-off plot
+# =========================
+
+def plot_cost_emission_tradeoff(summary_by_case, flex_share=0.20):
+    d = summary_by_case.copy()
+
+    sub = d[
+        (d["rule"] == "C") &
+        (np.isclose(d["flex_share"], flex_share)) &
+        (d["tariff"].isin(["flat", "tou", "rtp"]))
+    ].sort_values(["tariff", "alpha"])
+
+    plt.figure(figsize=(8, 6))
+
+    for tariff in ["flat", "tou", "rtp"]:
+        s = sub[sub["tariff"] == tariff]
+        plt.plot(
+            s["total_cost_change_EUR"],
+            s["total_emission_reduction_kgCO2"],
+            marker="o",
+            label=tariff.upper()
+        )
+
+        for _, row in s.iterrows():
+            plt.annotate(
+                f"{row['alpha']:.2f}",
+                (row["total_cost_change_EUR"], row["total_emission_reduction_kgCO2"]),
+                textcoords="offset points",
+                xytext=(5, 5),
+                fontsize=8
+            )
+
+    plt.axvline(0, linewidth=1)
+    plt.title(f"Cost-emission trade-off, flex={flex_share}")
+    plt.xlabel("Total cost change (EUR)")
+    plt.ylabel("Total emission reduction (kgCO₂)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(title="Tariff")
+    plt.tight_layout()
+    plt.show()
+
+
+plot_cost_emission_tradeoff(summary_by_case, flex_share=0.20)
